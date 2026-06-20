@@ -1,0 +1,24 @@
+# Secrets — never commit your API key
+.env
+
+# Local Claude Code guidance
+CLAUDE.md
+
+# Generated transcripts/summaries
+output/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+.mypy_cache/
+.ruff_cache/
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+.claude/settings.local.json
