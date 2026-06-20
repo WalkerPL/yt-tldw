@@ -7,7 +7,9 @@ and get back two Markdown files:
   punctuated prose.
 - `output/<slug>.summary.md` — a detailed, sectioned summary (Overview →
   topic-by-topic sections → Key takeaways) that covers everything said but is far
-  shorter than the talk.
+  shorter than the talk. Section headings and specific points carry **clickable
+  timestamps** that open the video at that moment, so you can jump straight to the
+  source.
 
 The AI passes (transcript cleanup + summary) use the **OpenAI API**.
 
@@ -19,19 +21,27 @@ generated summary in [examples/how-to-sound-smart.summary.md](examples/how-to-so
 ```markdown
 ## Overview
 
-Will Stephen's talk is a deliberate demonstration of how a speaker can sound
-intelligent, prepared, and meaningful while actually saying nothing. By using
-gestures, pacing, visuals, fake structure, and rhetorical flourishes, he shows
-how style can create the illusion of substance.
+Will Stephen's talk is a deliberately empty performance about how speakers can
+sound intelligent without actually saying anything. By openly demonstrating the
+tricks of confident delivery—gestures, pacing, visuals, fake data, and rhetorical
+buildup—he shows how style can create the illusion of substance.
 
-## Performing intelligence without substance
+## [1:02](https://www.youtube.com/watch?v=8S0FDjFBj8o&t=62s) How performance creates the illusion of meaning
+
+He begins "the opening" with deliberate hand gestures, glasses-adjusting, and a
+show-of-hands question to create the feel of engagement [1:02](...&t=62s). He then
+pretends to share a personal anecdote ... gesturing toward a scientist image he
+admits he found by googling "Scientist" [1:30](...&t=90s).
 ...
 ## Key takeaways
 
-- A speaker can create the illusion of intelligence through delivery alone.
-- Gestures, pacing, visuals, and tone can substitute for actual content.
+- Confident delivery can create the illusion of intelligence even when the content is empty.
+- Charts, numbers, and visuals can function as authority signals even when they add no real substance.
 - ...
 ```
+
+Headings and specific points carry clickable timestamps linking back to that
+moment in the video.
 
 ## Requirements
 
@@ -108,13 +118,18 @@ transcript.
 1. **`yt-dlp`** fetches metadata and the English caption track — a human-authored
    track if one exists, otherwise the auto-generated one. No video is downloaded.
 2. The VTT is parsed, inline timing tags stripped, and YouTube's **rolling-caption
-   duplicates** collapsed into one clean copy of each phrase.
+   duplicates** collapsed into one clean copy of each phrase — keeping each
+   phrase's start time.
 3. The whole transcript is **punctuation-restored** by the model in a single pass
    — same words, made readable. Only transcripts longer than ~45k words (≈ 5–6
-   hours) fall back to chunked cleanup, to stay under the model's output cap.
-4. The cleaned transcript is summarized in a single pass into the sectioned
-   summary. With gpt-5.4-mini's 400k context window, even a multi-hour talk
-   (~35k tokens) is summarized whole, so no cross-section context is lost.
+   hours) fall back to chunked cleanup, to stay under the model's output cap. This
+   produces `transcript.md`.
+4. A timestamped copy of the transcript (with `[h:mm:ss]` markers every ~30s) is
+   summarized in a single pass into the sectioned summary. The model stamps each
+   section heading and specific points with the nearest marker; those are then
+   rewritten into **clickable links** to the video at that second. With
+   gpt-5.4-mini's 400k context window, even a multi-hour talk (~35k tokens) is
+   summarized whole, so no cross-section context is lost.
 
 ## Notes & troubleshooting
 

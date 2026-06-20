@@ -41,6 +41,11 @@ SINGLE_PASS_MAX_WORDS = 45000
 # is roughly as long as its input, so chunks keep each call's output bounded.
 CHUNK_WORDS = 2800
 
+# Cadence of [h:mm:ss] markers interleaved into the transcript handed to the
+# summary pass, so the model can stamp sections/claims with a nearby timestamp.
+# 30s gives good resolution at negligible token cost (~120 markers for a 1h talk).
+TIMESTAMP_INTERVAL_SEC = 30
+
 # Live model-pricing registry (LiteLLM's community-maintained price list). Fetched
 # once and cached, so we don't hardcode rates that go stale. Override per run with
 # PRICE_INPUT / PRICE_OUTPUT (dollars per 1M tokens); offline, fall back to the
@@ -127,12 +132,17 @@ def fetch_metadata(url: str) -> dict:
         die(f"yt-dlp could not read the video:\n{proc.stderr.strip()}")
     line = proc.stdout.strip().splitlines()[0]
     vid, title, channel, upload_date, duration = (line.split(sep) + [""] * 5)[:5]
+    try:
+        duration_seconds = int(float(duration))
+    except (ValueError, TypeError):
+        duration_seconds = 0
     return {
         "id": vid,
         "title": title or vid,
         "channel": channel,
         "upload_date": _fmt_date(upload_date),
         "duration": _fmt_duration(duration),
+        "duration_seconds": duration_seconds,
         "url": f"https://www.youtube.com/watch?v={vid}" if vid else url,
     }
 
@@ -169,21 +179,41 @@ def fetch_captions(url: str, tmp: Path) -> str:
 _TS_LINE = re.compile(r"-->")
 _TAG = re.compile(r"<[^>]+>")            # <00:00:01.234>, <c>, </c>
 _CUE_SETTINGS = re.compile(r"\s+(align|position|line|size):\S+")
+# A VTT cue start timestamp at the left of a "start --> end" line.
+_CUE_START = re.compile(r"(?:(\d+):)?(\d{1,2}):(\d{2})(?:\.(\d{1,3}))?\s*-->")
 
 
-def parse_vtt(vtt: str) -> list[str]:
-    """Extract spoken phrase lines from a VTT, de-duplicating rolling captions.
+def _vtt_ts_to_seconds(ts_line: str) -> float | None:
+    """Parse the start time (in seconds) from a VTT 'start --> end ...' line."""
+    m = _CUE_START.search(ts_line)
+    if not m:
+        return None
+    h, mm, ss, ms = m.groups()
+    return (int(h or 0) * 3600 + int(mm) * 60 + int(ss) + int(ms or 0) / 1000.0)
+
+
+def parse_vtt(vtt: str) -> list[tuple[float, str]]:
+    """Extract (start_seconds, phrase) pairs from a VTT, de-duplicating rolling
+    captions.
 
     YouTube auto-captions repeat each line as the next caption scrolls up, so a
     naive read produces every phrase 2-3 times. Stripping inline tags and then
     collapsing consecutive duplicate lines yields one clean copy of each phrase.
+    Each phrase keeps the start time of the cue it first appeared in, so the
+    earliest timestamp wins when duplicates collapse.
     """
-    lines: list[str] = []
+    lines: list[tuple[float, str]] = []
+    cur_start = 0.0
     for raw in vtt.splitlines():
         line = raw.strip()
         if not line:
             continue
-        if line in ("WEBVTT",) or _TS_LINE.search(line):
+        if _TS_LINE.search(line):
+            t = _vtt_ts_to_seconds(line)
+            if t is not None:
+                cur_start = t
+            continue
+        if line == "WEBVTT":
             continue
         if line.startswith(("Kind:", "Language:", "NOTE")):
             continue
@@ -193,9 +223,9 @@ def parse_vtt(vtt: str) -> list[str]:
         text = _CUE_SETTINGS.sub("", text).strip()
         if not text:
             continue
-        if lines and text == lines[-1]:  # collapse rolling duplicates
+        if lines and text == lines[-1][1]:  # collapse rolling duplicates
             continue
-        lines.append(text)
+        lines.append((cur_start, text))
     return lines
 
 
@@ -215,6 +245,24 @@ def chunk_lines(lines: list[str], max_words: int = CHUNK_WORDS) -> list[str]:
     if buf:
         chunks.append(" ".join(buf))
     return chunks
+
+
+def build_timed_text(
+    timed: list[tuple[float, str]], interval: int = TIMESTAMP_INTERVAL_SEC
+) -> str:
+    """Render phrases as flowing text with an [h:mm:ss] marker inserted whenever
+    the running start time crosses the next `interval`-second threshold. The
+    summary model reads these markers to stamp sections and claims; they are
+    later converted into clickable links by `linkify_timestamps`."""
+    parts: list[str] = []
+    next_mark = 0.0
+    for start, text in timed:
+        if start >= next_mark:
+            parts.append(f"[{_fmt_duration(str(int(start)))}]")
+            # Advance past the current time so we emit one marker per interval.
+            next_mark = (int(start) // interval + 1) * interval
+        parts.append(text)
+    return " ".join(parts)
 
 
 # --------------------------------------------------------------------------- #
@@ -334,11 +382,47 @@ def ai_summarize(client, model: str, transcript: str, meta: dict) -> str:
         "its central thrust). Then use only as many `## <topic>` sections as the "
         "material genuinely warrants, following the talk's flow — a short talk may "
         "need just one or two. End with a `## Key takeaways` bullet list.\n"
+        "- TIMESTAMPS: the transcript is interspersed with `[h:mm:ss]` timestamp "
+        "markers showing when each part was said. Begin every `## <topic>` heading "
+        "with the marker nearest where that section starts, e.g. "
+        "`## [12:34] The topic`. When you reference a specific claim, example, "
+        "quote, or moment in the body, append the nearest marker inline, e.g. "
+        "`... as shown in the demo [41:07].` Copy timestamps verbatim from the "
+        "markers; use ONLY times that appear as markers — never invent or estimate "
+        "one. Do not timestamp the `## Overview` or `## Key takeaways` headings. "
+        "Ignore non-speech tags like `[music]` or `[laughter]` — they are not "
+        "timestamps.\n"
         "- Do not invent anything not in the transcript. Output only the Markdown "
         "(start at the `## Overview` heading).\n\n"
         f"---\nTRANSCRIPT:\n{transcript}"
     )
     return _chat(client, model, SUMMARY_SYSTEM, prompt, max_tokens=32000)
+
+
+# A bracketed timestamp the summary model emitted, e.g. [12:34] or [1:02:03].
+_SUMMARY_TS = re.compile(r"\[(\d{1,2}):(\d{2})(?::(\d{2}))?\]")
+
+
+def linkify_timestamps(summary: str, base_url: str, max_seconds: int = 0) -> str:
+    """Turn `[h:mm:ss]` / `[m:ss]` markers in the summary into clickable links to
+    the video at that moment, reusing the brackets as the link text:
+    `[12:34]` -> `[12:34](https://...&t=754s)`.
+
+    Times that can't be parsed or that fall beyond the video's duration are left
+    as plain text (graceful degradation against an invented timestamp)."""
+    sep = "&" if "?" in base_url else "?"
+
+    def repl(m: re.Match) -> str:
+        a, b, c = m.groups()
+        if c is not None:            # h:mm:ss
+            secs = int(a) * 3600 + int(b) * 60 + int(c)
+        else:                        # m:ss
+            secs = int(a) * 60 + int(b)
+        if max_seconds and secs > max_seconds + 2:  # small slack for rounding
+            return m.group(0)
+        return f"{m.group(0)}({base_url}{sep}t={secs}s)"
+
+    return _SUMMARY_TS.sub(repl, summary)
 
 
 # --------------------------------------------------------------------------- #
@@ -484,9 +568,10 @@ def main() -> None:
     print("Fetching captions...", file=sys.stderr)
     with tempfile.TemporaryDirectory() as td:
         vtt = fetch_captions(args.url, Path(td))
-    lines = parse_vtt(vtt)
-    if not lines:
+    timed = parse_vtt(vtt)
+    if not timed:
         die("captions were downloaded but no spoken text could be extracted.")
+    lines = [text for _, text in timed]
     raw_text = " ".join(lines)
     print(f"  extracted ~{len(raw_text.split())} words.", file=sys.stderr)
 
@@ -496,7 +581,8 @@ def main() -> None:
     transcript = ai_clean(client, args.model, lines)
 
     print("Summarizing...", file=sys.stderr)
-    summary = ai_summarize(client, args.model, transcript, meta)
+    summary = ai_summarize(client, args.model, build_timed_text(timed), meta)
+    summary = linkify_timestamps(summary, meta["url"], meta["duration_seconds"])
 
     t_words = len(transcript.split())
     s_words = len(summary.split())
