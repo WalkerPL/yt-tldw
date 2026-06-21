@@ -5,7 +5,7 @@ Usage:
     python yt_summarize.py "https://www.youtube.com/watch?v=..." [options]
 
 Pipeline:
-    URL -> yt-dlp (English captions + metadata)
+    URL -> yt-dlp (captions in the requested language + metadata)
         -> parse VTT + de-duplicate rolling captions  -> raw phrase lines
         -> OpenAI cleanup pass (single call; chunked   -> <slug>.transcript.md
            only for very long transcripts)
@@ -65,6 +65,16 @@ PRICING_FALLBACK = {
 
 # Accumulated token usage across all OpenAI calls in a run.
 USAGE = {"prompt": 0, "completion": 0, "reasoning": 0, "cached": 0}
+
+# Caption language code -> human name, used to tell the summary model which
+# language to write in. Unmapped codes fall back to the raw code in the prompt.
+LANG_NAMES = {
+    "en": "English", "pl": "Polish", "es": "Spanish", "de": "German",
+    "fr": "French", "it": "Italian", "pt": "Portuguese", "nl": "Dutch",
+    "ru": "Russian", "uk": "Ukrainian", "cs": "Czech", "sv": "Swedish",
+    "ja": "Japanese", "ko": "Korean", "zh": "Chinese", "ar": "Arabic",
+    "hi": "Hindi", "tr": "Turkish",
+}
 
 CLEANUP_SYSTEM = (
     "You restore readability to raw, auto-generated speech-to-text. "
@@ -147,14 +157,14 @@ def fetch_metadata(url: str) -> dict:
     }
 
 
-def fetch_captions(url: str, tmp: Path) -> str:
-    """Download English captions (manual preferred, else auto) and return the VTT text."""
+def fetch_captions(url: str, tmp: Path, lang: str = "en") -> str:
+    """Download captions in `lang` (manual preferred, else auto) and return the VTT text."""
     proc = _run_ytdlp([
         "--skip-download",
         "--no-warnings",
         "--write-subs",        # human-authored track wins if present
         "--write-auto-subs",   # fall back to auto-generated
-        "--sub-langs", "en.*,en",
+        "--sub-langs", f"{lang}.*,{lang}",
         "--sub-format", "vtt/best",
         "-o", str(tmp / "%(id)s.%(ext)s"),
         url,
@@ -163,9 +173,9 @@ def fetch_captions(url: str, tmp: Path) -> str:
     if not vtts:
         extra = f"\n{proc.stderr.strip()}" if proc.stderr.strip() else ""
         die(
-            "no English captions available for this video. "
-            "Only videos with English (manual or auto-generated) captions are "
-            f"supported.{extra}"
+            f"no '{lang}' captions available for this video. "
+            f"Only videos with '{lang}' (manual or auto-generated) captions are "
+            f"supported. Try a different --lang.{extra}"
         )
     # Prefer a manual track (filename without the auto-only language tags) when
     # several exist; otherwise just take the first.
@@ -365,23 +375,32 @@ def ai_clean(client, model: str, lines: list[str]) -> str:
     return "\n\n".join(cleaned)
 
 
-def ai_summarize(client, model: str, transcript: str, meta: dict) -> str:
+def ai_summarize(client, model: str, transcript: str, meta: dict, lang: str = "en") -> str:
+    language = LANG_NAMES.get(lang, lang)
     prompt = (
         f"Below is the full transcript of a talk/interview titled "
         f"\"{meta['title']}\""
         + (f" by {meta['channel']}" if meta["channel"] else "")
         + ".\n\nWrite a faithful summary in Markdown.\n\n"
         "Requirements:\n"
+        f"- LANGUAGE: write the entire summary in {language} (the language of the "
+        f"transcript) — every `## ` heading, the body prose, and the bullet "
+        f"points must all be in {language}.\n"
         "- LENGTH: keep it tight and clearly shorter than the source — distill, "
         "don't transcribe. Compress aggressively; never pad, restate, or add "
         "filler.\n"
         "- COVERAGE: include every substantive point, argument, example, and "
         "conclusion, but drop filler, repetition, and digressions. A reader "
         "should learn essentially everything that was said.\n"
-        "- STRUCTURE: start with an `## Overview` (2-3 sentences on the talk and "
-        "its central thrust). Then use only as many `## <topic>` sections as the "
-        "material genuinely warrants, following the talk's flow — a short talk may "
-        "need just one or two. End with a `## Key takeaways` bullet list.\n"
+        "- STRUCTURE: start with a brief overview section (a single `## ` heading "
+        "followed by 2-3 sentences on the talk and its central thrust). Then use "
+        "only as many `## <topic>` sections as the material genuinely warrants, "
+        "following the talk's flow — a short talk may need just one or two. End "
+        "with a key-takeaways section: a final `## ` heading followed by a bullet "
+        f"list. IMPORTANT: write the overview and key-takeaways heading labels in "
+        f"{language} — translate the English words 'Overview' and 'Key takeaways' "
+        f"into {language}; do NOT leave them in English (unless {language} is "
+        "English).\n"
         "- TIMESTAMPS: the transcript is interspersed with `[h:mm:ss]` timestamp "
         "markers showing when each part was said. Begin every `## <topic>` heading "
         "with the marker nearest where that section starts, e.g. "
@@ -389,11 +408,11 @@ def ai_summarize(client, model: str, transcript: str, meta: dict) -> str:
         "quote, or moment in the body, append the nearest marker inline, e.g. "
         "`... as shown in the demo [41:07].` Copy timestamps verbatim from the "
         "markers; use ONLY times that appear as markers — never invent or estimate "
-        "one. Do not timestamp the `## Overview` or `## Key takeaways` headings. "
-        "Ignore non-speech tags like `[music]` or `[laughter]` — they are not "
-        "timestamps.\n"
+        "one. Do not put a timestamp on the overview heading or the key-takeaways "
+        "heading. Ignore non-speech tags like `[music]` or `[laughter]` — they are "
+        "not timestamps.\n"
         "- Do not invent anything not in the transcript. Output only the Markdown "
-        "(start at the `## Overview` heading).\n\n"
+        "(start at the overview heading).\n\n"
         f"---\nTRANSCRIPT:\n{transcript}"
     )
     return _chat(client, model, SUMMARY_SYSTEM, prompt, max_tokens=32000)
@@ -460,6 +479,8 @@ def header(meta: dict, kind: str, words: int | None = None) -> str:
     if meta["duration"]:
         bits.append(f"- **Duration:** {meta['duration']}")
     bits.append(f"- **Source:** {meta['url']}")
+    if meta.get("language"):
+        bits.append(f"- **Language:** {meta['language']}")
     if words is not None:
         bits.append(f"- **Words:** {words:,}")
     bits.append("")
@@ -557,6 +578,8 @@ def main() -> None:
     )
     ap.add_argument("--keep-raw", action="store_true",
                     help="also write the un-cleaned mechanical transcript")
+    ap.add_argument("--lang", default="en",
+                    help="caption language code, e.g. en, pl, es, de (default: en)")
     args = ap.parse_args()
 
     outdir = Path(args.outdir)
@@ -564,10 +587,11 @@ def main() -> None:
 
     print("Fetching metadata...", file=sys.stderr)
     meta = fetch_metadata(args.url)
+    meta["language"] = LANG_NAMES.get(args.lang, args.lang)
 
-    print("Fetching captions...", file=sys.stderr)
+    print(f"Fetching {args.lang} captions...", file=sys.stderr)
     with tempfile.TemporaryDirectory() as td:
-        vtt = fetch_captions(args.url, Path(td))
+        vtt = fetch_captions(args.url, Path(td), args.lang)
     timed = parse_vtt(vtt)
     if not timed:
         die("captions were downloaded but no spoken text could be extracted.")
@@ -581,7 +605,7 @@ def main() -> None:
     transcript = ai_clean(client, args.model, lines)
 
     print("Summarizing...", file=sys.stderr)
-    summary = ai_summarize(client, args.model, build_timed_text(timed), meta)
+    summary = ai_summarize(client, args.model, build_timed_text(timed), meta, args.lang)
     summary = linkify_timestamps(summary, meta["url"], meta["duration_seconds"])
 
     t_words = len(transcript.split())

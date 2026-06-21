@@ -43,6 +43,11 @@ admits he found by googling "Scientist" [1:30](...&t=90s).
 Headings and specific points carry clickable timestamps linking back to that
 moment in the video.
 
+The same video summarized with `--lang pl` is in
+[examples/how-to-sound-smart.summary.pl.md](examples/how-to-sound-smart.summary.pl.md) —
+the prose, headings (`## Przegląd`, `## Najważniejsze wnioski`), and takeaways
+all come out in the requested language.
+
 ## Requirements
 
 - Python 3.9+
@@ -74,6 +79,7 @@ Options:
 |------|---------|---------|
 | `--outdir DIR` | `output` | where the `.md` files are written |
 | `--model NAME` | `gpt-5.4-mini` (or `$OPENAI_MODEL`) | OpenAI chat model for both passes |
+| `--lang CODE` | `en` | caption language to download, e.g. `pl`, `es`, `de`; the summary is written in that language too |
 | `--keep-raw` | off | also write the un-cleaned mechanical transcript (`.raw.txt`) |
 
 `OPENAI_API_KEY` is read from a `.env` file in the project directory (or the
@@ -84,6 +90,14 @@ account, e.g.:
 python yt_summarize.py "<url>" --model gpt-4o
 # or
 export OPENAI_MODEL=gpt-4o
+```
+
+By default the tool downloads the **English** caption track and writes both files
+in English. Pass `--lang` to use another language — the transcript and the
+summary are both produced in that language:
+
+```bash
+python yt_summarize.py "<url>" --lang pl   # Polish transcript + Polish summary
 ```
 
 On completion the script prints the output paths with word counts (and the
@@ -115,8 +129,9 @@ transcript.
 
 ## How it works
 
-1. **`yt-dlp`** fetches metadata and the English caption track — a human-authored
-   track if one exists, otherwise the auto-generated one. No video is downloaded.
+1. **`yt-dlp`** fetches metadata and the caption track for the requested language
+   (`--lang`, English by default) — a human-authored track if one exists,
+   otherwise the auto-generated one. No video is downloaded.
 2. The VTT is parsed, inline timing tags stripped, and YouTube's **rolling-caption
    duplicates** collapsed into one clean copy of each phrase — keeping each
    phrase's start time.
@@ -133,8 +148,10 @@ transcript.
 
 ## Notes & troubleshooting
 
-- **No English captions** → the script exits with a clear message. Videos without
-  any English (manual or auto) captions aren't supported.
+- **No captions in the requested language** → the script exits with a clear
+  message. The track must already exist on the video (manual or auto-generated)
+  in that language — the tool requests the published track and does **not** ask
+  YouTube to auto-translate one that isn't there. Try a different `--lang`.
 - **YouTube bot-throttling** (`Sign in to confirm you're not a bot`, HTTP 429): pass
   cookies from a logged-in browser by adding the flag to the `yt-dlp` call, or run
   `yt-dlp` once manually with `--cookies-from-browser chrome` to confirm access.
